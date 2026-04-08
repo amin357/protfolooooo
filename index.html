@@ -2600,47 +2600,29 @@
       </div>
     </div>
 
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
     <script>
       // ═══════════════════
-      // STORAGE — localStorage لحفظ الأعمال
+      // SUPABASE CONFIG
       // ═══════════════════
-      const DB_KEY = "vmin_works_v5";
+      const SUPABASE_URL = 'https://qikchvcvrgbsxbligczp.supabase.co';
+      const SUPABASE_ANON = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFpa2NodmN2cmdic3hibGlnY3pwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzU2NzczMTksImV4cCI6MjA5MTI1MzMxOX0.Z908WircJVvlK41wGz0rNkD1SqYT9dyq9F1_w-ddq20';
+      const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON);
 
-      function loadProjects() {
-        try {
-          return JSON.parse(localStorage.getItem(DB_KEY) || "[]");
-        } catch (e) {
-          return [];
-        }
+      // ═══════════════════
+      // STORAGE — Supabase cloud database
+      // ═══════════════════
+      let projects = [];
+
+      async function loadProjects() {
+        const { data, error } = await sb.from('projects').select('*').order('created_at', { ascending: true });
+        if (error) { console.error('Load error:', error); return []; }
+        // map DB columns to the format the renderer expects
+        return (data || []).map(r => ({
+          id: r.id, name: r.name, cat: r.cat, label: r.label,
+          c1: r.c1, c2: r.c2, c3: r.c3, link: r.link, img: r.img_url
+        }));
       }
-
-      function saveProjects(arr) {
-        try {
-          localStorage.setItem(DB_KEY, JSON.stringify(arr));
-          return true;
-        } catch (e) {
-          // localStorage full — compress by removing large images from old entries
-          if (e.name === "QuotaExceededError") {
-            const trimmed = arr.map((p, i) =>
-              i < arr.length - 1 && p.img && p.img.length > 50000
-                ? { ...p, img: null }
-                : p,
-            );
-            try {
-              localStorage.setItem(DB_KEY, JSON.stringify(trimmed));
-              return true;
-            } catch (e2) {
-              return false;
-            }
-          }
-          return false;
-        }
-      }
-
-      let projects = loadProjects();
-      let nextId = projects.length
-        ? Math.max(...projects.map((p) => p.id || 0)) + 1
-        : 1;
 
       // ═══════════════════
       // GRID LAYOUT
@@ -2743,7 +2725,7 @@
       // ═══════════════════
       // ADD PROJECT
       // ═══════════════════
-      let pendingImg = null;
+      let pendingFile = null;
 
       function prevImg(e) {
         const f = e.target.files[0];
@@ -2752,11 +2734,11 @@
           alert("Maximum file size is 5MB");
           return;
         }
+        pendingFile = f;
         const r = new FileReader();
         r.onload = (ev) => {
-          pendingImg = ev.target.result;
           const p = document.getElementById("uprev");
-          p.src = pendingImg;
+          p.src = ev.target.result;
           p.style.display = "block";
           document.getElementById("uarea").style.borderColor =
             "rgba(232,40,30,.55)";
@@ -2764,7 +2746,7 @@
         r.readAsDataURL(f);
       }
 
-      function addProject() {
+      async function addProject() {
         const name = document.getElementById("m-name").value.trim();
         const cat = document.getElementById("m-cat").value;
         const label = document.getElementById("m-label").value.trim();
@@ -2780,23 +2762,32 @@
           alert("Please select a category");
           return;
         }
-        const p = {
-          id: nextId++,
-          name,
-          cat,
-          label: label || cat,
-          c1,
-          c2,
-          c3,
-          link: link || "#",
-          img: pendingImg || null,
-        };
-        projects.push(p);
-        const ok = saveProjects(projects);
-        if (!ok)
-          alert(
-            "Warning: storage full, cover image not saved. Try a smaller image.",
-          );
+
+        let img_url = null;
+
+        // Upload image to Supabase Storage if one is selected
+        if (pendingFile) {
+          const ext = pendingFile.name.split('.').pop();
+          const fileName = Date.now() + '_' + Math.random().toString(36).slice(2, 8) + '.' + ext;
+          const { data: upData, error: upErr } = await sb.storage
+            .from('project-images')
+            .upload(fileName, pendingFile, { cacheControl: '3600', upsert: false });
+          if (upErr) {
+            alert('Image upload failed: ' + upErr.message);
+            return;
+          }
+          const { data: urlData } = sb.storage.from('project-images').getPublicUrl(fileName);
+          img_url = urlData.publicUrl;
+        }
+
+        const row = { name, cat, label: label || cat, c1, c2, c3, link: link || '#', img_url };
+        const { error } = await sb.from('projects').insert([row]);
+        if (error) {
+          alert('Failed to save project: ' + error.message);
+          return;
+        }
+
+        projects = await loadProjects();
         renderGrid();
         closeModal();
         resetForm();
@@ -2809,11 +2800,18 @@
         );
       }
 
-      function delProject(id, e) {
+      async function delProject(id, e) {
         e.stopPropagation();
         if (!confirm("Delete this project?")) return;
-        projects = projects.filter((p) => p.id !== id);
-        saveProjects(projects);
+        // Delete image from storage if exists
+        const proj = projects.find(p => p.id === id);
+        if (proj && proj.img) {
+          const parts = proj.img.split('/project-images/');
+          if (parts[1]) { await sb.storage.from('project-images').remove([parts[1]]); }
+        }
+        const { error } = await sb.from('projects').delete().eq('id', id);
+        if (error) { alert('Delete failed: ' + error.message); return; }
+        projects = await loadProjects();
         renderGrid();
       }
 
@@ -2828,7 +2826,7 @@
         document.getElementById("uprev").style.display = "none";
         document.getElementById("uarea").style.borderColor = "";
         document.getElementById("m-img").value = "";
-        pendingImg = null;
+        pendingFile = null;
       }
 
       // ═══════════════════
@@ -3057,9 +3055,10 @@
             const pre = document.getElementById("preloader");
             pre.style.transition = "opacity .55s ease";
             pre.style.opacity = "0";
-            setTimeout(() => {
+            setTimeout(async () => {
               pre.style.display = "none";
               document.querySelector(".hero").classList.add("loaded");
+              projects = await loadProjects();
               renderGrid();
               initReveal();
               initBars();
